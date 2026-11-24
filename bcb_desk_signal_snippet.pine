@@ -1,0 +1,27 @@
+// BCB Desk signal alert - goes at the BOTTOM of your "FX Trader" indicator.
+// Two lines must point at FX Trader's own BUY / SELL conditions (marked >>> below).
+// Send Claude the FX Trader code and this gets merged in exactly - don't guess the names.
+
+deskSecret = input.string("", "Desk webhook secret", group = "BCB Desk")
+deskStopAtr = input.float(1.5, "Stop distance (x ATR)", group = "BCB Desk")
+
+deskAtr = ta.atr(14)
+[h4Close, h4Ema] = request.security(syminfo.tickerid, "240", [close, ta.ema(close, 50)], lookahead = barmerge.lookahead_off)
+deskTrend = h4Close > h4Ema ? "UP" : "DOWN"
+[pdHigh, pdLow] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+deskLevelDist = math.min(math.abs(close - pdHigh), math.abs(close - pdLow))
+
+deskMsg(string side, float stopPx) =>
+    '{"secret":"' + deskSecret + '","symbol":"XAUUSD","side":"' + side + '"' +
+     ',"price":' + str.tostring(close) + ',"stop":' + str.tostring(stopPx) +
+     ',"time":"' + str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '"' +
+     ',"trend_4h":"' + deskTrend + '","atr":' + str.tostring(deskAtr) +
+     ',"level_distance":' + str.tostring(deskLevelDist) + '}'
+
+deskBuy = false   // >>> replace false with FX Trader's BUY condition
+deskSell = false  // >>> replace false with FX Trader's SELL condition
+
+if deskBuy and barstate.isconfirmed
+    alert(deskMsg("BUY", close - deskStopAtr * deskAtr), alert.freq_once_per_bar_close)
+if deskSell and barstate.isconfirmed
+    alert(deskMsg("SELL", close + deskStopAtr * deskAtr), alert.freq_once_per_bar_close)
