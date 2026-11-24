@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "config.yaml"))
@@ -343,6 +343,10 @@ def handle_alert(alert, cfg, con, now):
         result = {"scout": card, "shield": None, "pilot": None}
         if card["status"] != "SETUP":
             return result
+        trade = open_trade(con)
+        if trade and trade["side"] != card["side"] and cfg.get("exit_on_opposite_signal"):
+            last = get_state(con, "last_price") or card["entry"]
+            result["closed"] = close_trade(con, cfg, trade, last, "swing flipped", now)
         decision = shield(card, cfg, con, now)
         journal(con, "Shield", decision["decision"], decision, now)
         result["shield"] = decision

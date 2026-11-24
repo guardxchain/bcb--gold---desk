@@ -1,0 +1,226 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © Zeiierman - Dynamic Swing VWAP. Modified: strategy wrapper, risk sizing, stops/targets, filters and order-fill alerts added.
+// BCB Gold Desk webhook added (bottom). Defaults set to Swing Period 14 / Tracking Speed 14.
+//@version=6
+strategy("FX Trader: Dynamic Swing VWAP Strategy", "SwingVWAP-S", overlay=true, initial_capital=6000, currency=currency.GBP, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.005, pyramiding=0, calc_on_every_tick=false, max_bars_back=5000, max_labels_count=500, max_polylines_count=100)
+
+// ~~ Signal inputs (original) {
+prd      = input.int(14, "Swing Period", minval=2, group="FX Signal Sensitivity")
+baseAPT  = input.float(14, "Price Tracking Speed", minval=1, step=1, group="FX Signal Sensitivity")
+useAdapt = input.bool(false, "Adapt by Volatility", group="FX Signal Sensitivity")
+volBias  = input.float(10.0, "Volatility Bias", minval=0.1, step=0.1, group="FX Signal Sensitivity")
+
+buyCol   = input.color(color.lime, "BUY Signal", group="FX Style", inline="Sig")
+sellCol  = input.color(color.red, "SELL Signal", group="FX Style", inline="Sig")
+upVwap   = input.color(color.lime, "Bullish VWAP", group="FX Style", inline="Line")
+dnVwap   = input.color(color.red, "Bearish VWAP", group="FX Style", inline="Line")
+xx       = input.int(2, "Line Width", minval=1, group="FX Style")
+lblPivot = input.bool(false, "Label at the swing instead of the signal bar (original look)", group="FX Style")
+// }
+
+// ~~ Trade inputs {
+entryMode = input.string("Swing flip", "Entry", options=["Swing flip", "VWAP pullback"], group="Trade")
+stopMode  = input.string("Swing pivot", "Stop loss", options=["Swing pivot", "ATR multiple"], group="Trade")
+stopAtrX  = input.float(2.0, "ATR multiple (if selected)", minval=0.5, step=0.5, group="Trade")
+bufAtr    = input.float(0.1, "Stop buffer (x ATR)", minval=0, step=0.05, group="Trade")
+minAtr    = input.float(0.25, "Min stop (x ATR)", minval=0.05, step=0.05, group="Trade")
+useTP     = input.bool(false, "Fixed target", group="Trade", inline="tp")
+rr        = input.float(2.0, "R", minval=0.5, step=0.5, group="Trade", inline="tp")
+useVwapX  = input.bool(false, "Exit on close through the VWAP", group="Trade")
+riskCash  = input.float(250, "Risk per trade (GBP)", minval=10, group="Trade")
+maxQty    = input.float(35, "Max size (oz / units)", minval=0.1, group="Trade")
+// }
+
+// ~~ Filter inputs {
+useBias = input.bool(false, "4H trend filter (EMA 50)", group="Filters")
+useSess = input.bool(false, "Only enter during session", group="Filters")
+sessWin = input.session("0700-2000", "Session (UK time)", group="Filters")
+// }
+
+b  = bar_index
+tz = "Europe/London"
+
+// ~~ Pivots (original) {
+var ph  = float(na)
+var pl  = float(na)
+var phL = b
+var plL = b
+ph  := ta.highestbars(high, prd) == 0 ? high : ph
+pl  := ta.lowestbars(low, prd) == 0 ? low : pl
+phL := ta.highestbars(high, prd) == 0 ? b : phL
+plL := ta.lowestbars(low, prd) == 0 ? b : plL
+dir = phL > plL ? 1 : -1
+flipUp = dir != dir[1] and dir > 0
+flipDn = dir != dir[1] and dir < 0
+// }
+
+// ~~ Adaptation (original) {
+atrLen = 50
+atr    = ta.atr(atrLen)
+atrAvg = ta.rma(atr, atrLen)
+ratio  = atrAvg > 0 ? atr / atrAvg : 1.0
+aptRaw     = useAdapt ? baseAPT / math.pow(ratio, volBias) : baseAPT
+aptClamped = math.max(5.0, math.min(300.0, aptRaw))
+aptSeries  = math.round(aptClamped)
+alphaFromAPT(apt) =>
+    decay = math.exp(-math.log(2.0) / math.max(1.0, apt))
+    1.0 - decay
+// }
+
+// ~~ Anchored VWAP (original) {
+var p   = hlc3 * volume
+var vol = volume
+type dataPoints
+    array<chart.point> points
+    polyline poly = na
+var vwap = dataPoints.new(array.new<chart.point>())
+
+if dir != dir[1]
+    x = dir > 0 ? plL : phL
+    y = dir > 0 ? pl : ph
+    barsback = b - x
+    p   := y * volume[barsback]
+    vol := volume[barsback]
+    vwap.poly.delete()
+    vwap.points.clear()
+    for i = barsback to 0
+        alpha = alphaFromAPT(aptSeries[i])
+        p   := (1.0 - alpha) * p + alpha * hlc3[i] * volume[i]
+        vol := (1.0 - alpha) * vol + alpha * volume[i]
+        vwap.points.push(chart.point.from_index(b - i, vol > 0 ? p / vol : na))
+    vwap.poly := polyline.new(vwap.points, false, false, line_color = dir > 0 ? upVwap : dnVwap, line_width = xx)
+else
+    alpha = alphaFromAPT(aptSeries)
+    p   := (1.0 - alpha) * p + alpha * hlc3 * volume
+    vol := (1.0 - alpha) * vol + alpha * volume
+    vwap.poly.delete()
+    vwap.points.push(chart.point.from_index(b, vol > 0 ? p / vol : na))
+    vwap.poly := polyline.new(vwap.points, false, false, line_color = dir > 0 ? upVwap : dnVwap, line_width = xx)
+
+vwapVal = vol > 0 ? p / vol : na
+// }
+
+// ~~ Labels {
+if flipUp or flipDn
+    x   = flipUp ? plL : phL
+    y   = flipUp ? pl : ph
+    txt = flipUp ? "BUY" : "SELL"
+    col = flipUp ? buyCol : sellCol
+    sty = flipUp ? label.style_label_up : label.style_label_down
+    if lblPivot
+        label.new(x, y, text=txt, style=sty, color=color.new(col, 20), textcolor=color.white)
+    else
+        label.new(b, flipUp ? low : high, text=txt, style=sty, color=color.new(col, 20), textcolor=color.white)
+        label.new(x, y, style=label.style_circle, color=color.new(col, 40), size=size.tiny)
+// }
+
+// ~~ Filters, sizing, stops {
+h4c = request.security(syminfo.tickerid, "240", close)
+h4e = request.security(syminfo.tickerid, "240", ta.ema(close, 50))
+biasUp = not useBias or h4c > h4e
+biasDn = not useBias or h4c < h4e
+inSess = not useSess or not na(time(timeframe.period, sessWin, tz))
+
+gbpUsd  = request.security("FX:GBPUSD", "D", close)
+gbpJpy  = request.security("FX:GBPJPY", "D", close)
+quoteFx = syminfo.currency == "GBP" ? 1.0 : syminfo.currency == "JPY" ? gbpJpy : gbpUsd
+
+atr14 = ta.atr(14)
+buf   = atr14 * bufAtr
+pos   = strategy.position_size
+
+pbLong  = dir > 0 and not flipUp and low <= vwapVal and close > vwapVal and close > open
+pbShort = dir < 0 and not flipDn and high >= vwapVal and close < vwapVal and close < open
+longSig  = entryMode == "Swing flip" ? flipUp : pbLong
+shortSig = entryMode == "Swing flip" ? flipDn : pbShort
+
+lSL = stopMode == "Swing pivot" ? (entryMode == "Swing flip" ? pl : low) - buf : close - atr14 * stopAtrX
+lD  = close - lSL
+lQ  = math.min(maxQty, riskCash * quoteFx / lD)
+lTP = close + lD * rr
+doLong = longSig and biasUp and inSess and lD >= atr14 * minAtr and (entryMode == "Swing flip" ? pos <= 0 : pos == 0)
+
+sSL = stopMode == "Swing pivot" ? (entryMode == "Swing flip" ? ph : high) + buf : close + atr14 * stopAtrX
+sD  = sSL - close
+sQ  = math.min(maxQty, riskCash * quoteFx / sD)
+sTP = close - sD * rr
+doShort = shortSig and biasDn and inSess and sD >= atr14 * minAtr and (entryMode == "Swing flip" ? pos >= 0 : pos == 0)
+// }
+
+// ~~ Exits {
+if pos > 0 and (flipDn or (useVwapX and close < vwapVal)) and not doShort
+    strategy.close("L", alert_message="EXIT " + syminfo.ticker + " long | " + (flipDn ? "swing flipped" : "VWAP lost"))
+if pos < 0 and (flipUp or (useVwapX and close > vwapVal)) and not doLong
+    strategy.close("S", alert_message="EXIT " + syminfo.ticker + " short | " + (flipUp ? "swing flipped" : "VWAP lost"))
+// }
+
+// ~~ Entries {
+var float curSL = na
+var float curTP = na
+if doLong
+    curSL := lSL
+    curTP := useTP ? lTP : na
+    strategy.entry("L", strategy.long, qty=lQ, alert_message="BUY " + syminfo.ticker + " | size " + str.tostring(lQ, "#.##") + " | entry " + str.tostring(close, "#.####") + " | SL " + str.tostring(lSL, "#.####") + (useTP ? " | TP " + str.tostring(lTP, "#.####") : ""))
+    strategy.exit("L stop", "L", stop=lSL, alert_message="EXIT " + syminfo.ticker + " long | stopped")
+    if useTP
+        strategy.exit("L target", "L", limit=lTP, alert_message="EXIT " + syminfo.ticker + " long | target hit")
+if doShort
+    curSL := sSL
+    curTP := useTP ? sTP : na
+    strategy.entry("S", strategy.short, qty=sQ, alert_message="SELL " + syminfo.ticker + " | size " + str.tostring(sQ, "#.##") + " | entry " + str.tostring(close, "#.####") + " | SL " + str.tostring(sSL, "#.####") + (useTP ? " | TP " + str.tostring(sTP, "#.####") : ""))
+    strategy.exit("S stop", "S", stop=sSL, alert_message="EXIT " + syminfo.ticker + " short | stopped")
+    if useTP
+        strategy.exit("S target", "S", limit=sTP, alert_message="EXIT " + syminfo.ticker + " short | target hit")
+
+plot(pos != 0 ? curSL : na, "Stop", color.new(color.red, 0), 1, plot.style_linebr)
+plot(pos != 0 and useTP ? curTP : na, "Target", color.new(color.green, 0), 1, plot.style_linebr)
+// }
+
+// ~~ Stats box {
+tfTxt = timeframe.isminutes ? timeframe.period + "m" : timeframe.period
+var table t = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 20), border_width=1)
+if barstate.islast
+    n  = strategy.closedtrades
+    w  = strategy.wintrades
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    table.cell(t, 0, 0, "Chart", text_color=color.white)
+    table.cell(t, 1, 0, tfTxt, text_color=color.white)
+    table.cell(t, 0, 1, "Trades", text_color=color.white)
+    table.cell(t, 1, 1, str.tostring(n), text_color=color.white)
+    table.cell(t, 0, 2, "Win %", text_color=color.white)
+    table.cell(t, 1, 2, n > 0 ? str.tostring(100.0 * w / n, "#.#") : "-", text_color=color.white)
+    table.cell(t, 0, 3, "Profit factor", text_color=color.white)
+    table.cell(t, 1, 3, na(pf) ? "-" : str.tostring(pf, "#.##"), text_color=color.white)
+    table.cell(t, 0, 4, "Net P/L", text_color=color.white)
+    table.cell(t, 1, 4, str.tostring(strategy.netprofit, "#.##"), text_color=color.white)
+    table.cell(t, 0, 5, "Max DD", text_color=color.white)
+    table.cell(t, 1, 5, str.tostring(strategy.max_drawdown, "#.##"), text_color=color.white)
+// }
+
+// ~~ Swing alerts (as before, alongside the order-fill alerts) {
+alertcondition(flipUp, title="BUY swing", message="FX BUY Signal Detected on {{ticker}}")
+alertcondition(flipDn, title="SELL swing", message="FX SELL Signal Detected on {{ticker}}")
+// }
+
+// ~~ BCB Gold Desk webhook {
+// Alert set-up: Condition = this strategy, "alert() function calls only", webhook https://<railway-domain>/alert
+deskOn     = input.bool(true, "Send signals to BCB Gold Desk", group="BCB Desk")
+deskSecret = input.string("", "Desk webhook secret", group="BCB Desk")
+[pdHigh, pdLow] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+deskLevelDist = math.min(math.abs(close - pdHigh), math.abs(close - pdLow))
+deskTrend = h4c > h4e ? "UP" : "DOWN"
+
+deskMsg(string side, float stopPx) =>
+    '{"secret":"' + deskSecret + '","symbol":"XAUUSD","side":"' + side + '"' +
+     ',"price":' + str.tostring(close, "#.##") + ',"stop":' + str.tostring(stopPx, "#.##") +
+     ',"time":"' + str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '"' +
+     ',"trend_4h":"' + deskTrend + '","atr":' + str.tostring(atr14, "#.##") +
+     ',"level_distance":' + str.tostring(deskLevelDist, "#.##") +
+     ',"gbpusd":' + str.tostring(gbpUsd, "#.#####") + '}'
+
+if deskOn and barstate.isconfirmed and flipUp and lD >= atr14 * minAtr
+    alert(deskMsg("BUY", lSL), alert.freq_once_per_bar_close)
+if deskOn and barstate.isconfirmed and flipDn and sD >= atr14 * minAtr
+    alert(deskMsg("SELL", sSL), alert.freq_once_per_bar_close)
+// }
