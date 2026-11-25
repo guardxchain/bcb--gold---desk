@@ -15,8 +15,8 @@ mode: PAPER                    # PAPER or LIVE
 live_trading: false            # only becomes true after you type "go live"
 balance_start_gbp: 5000        # Pepperstone cTrader demo
 risk_per_trade_pct: 10          # £500 at £5,000
-daily_loss_limit_pct: 20       # Shield stops everything at -£500 (2 losses)
-max_losses_in_a_row: 2
+daily_loss_limit_pct: 40       # Shield stops everything at -£500 (2 losses)
+max_losses_in_a_row: 4
 daily_profit_target_pct: 20  # no profit cap - keep trading the swings
 stop_after_target_win: false   # keep trading after a winner
 max_open_trades: 1
