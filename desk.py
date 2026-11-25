@@ -18,12 +18,13 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-VERSION = "1.1.0"
+VERSION = "1.2.2"
 UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "config.yaml"))
+CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "bcbdesk_config.yaml"))
 DB_PATH = os.environ.get("DESK_DB", os.path.join(HERE, "desk.db"))
 LOCK = threading.RLock()
+STARTED = time.time()
 GRADES = {"A": 3, "B": 2, "C": 1}
 
 
@@ -181,13 +182,14 @@ def scout(alert, cfg, now):
     news_ok = not bool(alert.get("news"))
     passed = sum([trend_ok, level_ok, bool(session), news_ok])
     grade = "A" if passed == 4 else "B" if passed == 3 else "C"
-    target = price + direction * risk_usd * cfg["take_profit_r"]
+    tp_r = cfg.get("take_profit_r") or 0
+    target = price + direction * risk_usd * tp_r if tp_r > 0 else None
     notes = [("with" if trend_ok else "against") + " the 4H trend",
              ("near" if level_ok else "away from") + " a key level",
              f"{session} session" if session else "outside sessions",
              "no news flag" if news_ok else "NEWS flag"]
     return {"status": "SETUP", "side": side, "entry": round(price, 2), "stop": round(stop, 2),
-            "target": round(target, 2), "risk_usd": round(risk_usd, 2), "grade": grade,
+            "target": round(target, 2) if target else None, "risk_usd": round(risk_usd, 2), "grade": grade,
             "session": session, "reason": f"{side} {grade}: " + ", ".join(notes),
             "alert_time": sent.isoformat(), "gbpusd": float(alert.get("gbpusd") or cfg["gbpusd_estimate"])}
 
@@ -355,7 +357,7 @@ def handle_alert(alert, cfg, con, now):
             journal(con, "Pilot", fill["result"], fill, now)
             result["pilot"] = fill
             send_telegram(f"PAPER {card['side']} XAUUSD {decision['lots']} lots @ {fill.get('fill')} | "
-                          f"stop {card['stop']} | target {card['target']} | risk £{decision['risk_gbp']}\n"
+                          f"stop {card['stop']} | target {card['target'] or 'next flip'} | risk £{decision['risk_gbp']}\n"
                           f"{card['reason']}")
         elif card["grade"] == "A":
             send_telegram(f"A-grade {card['side']} setup BLOCKED by Shield: {decision['reason']}")
@@ -382,12 +384,12 @@ def handle_tick(tick, cfg, con, now):
         if trade["side"] == "BUY":
             if low <= trade["stop"]:  # stop first if both touched - worst case
                 return {"closed": close_trade(con, cfg, trade, trade["stop"] - slip, "stop", now)}
-            if high >= trade["target"]:
+            if trade["target"] is not None and high >= trade["target"]:
                 return {"closed": close_trade(con, cfg, trade, trade["target"], "target", now)}
         else:
             if high >= trade["stop"]:
                 return {"closed": close_trade(con, cfg, trade, trade["stop"] + slip, "stop", now)}
-            if low <= trade["target"]:
+            if trade["target"] is not None and low <= trade["target"]:
                 return {"closed": close_trade(con, cfg, trade, trade["target"], "target", now)}
         return {"ok": True}
 
@@ -431,7 +433,8 @@ def watchdog_once(cfg, con, now):
             close_trade(con, cfg, trade, last, "flat by close", now)
         last_tick = get_state(con, "last_tick_ts")
         if in_session(cfg, now) and not get_state(con, "feed_warned"):
-            if last_tick is None or now.timestamp() - last_tick > cfg["feed_dead_warn_seconds"]:
+            since = max(last_tick or 0, STARTED)  # give a fresh start time to receive its first price
+            if now.timestamp() - since > cfg["feed_dead_warn_seconds"]:
                 set_state(con, "feed_warned", True)
                 journal(con, "Shield", "FEED DEAD", {}, now)
                 send_telegram("Price feed has gone quiet - Shield is blocking new trades until it's back.")
@@ -475,6 +478,28 @@ class Handler(BaseHTTPRequestHandler):
                                      "day_pnl_gbp": day_pnl(self.con, now),
                                      "open_trade": dict(t) if t else None,
                                      "stopped_today": stopped_today(self.con, now)})
+        if self.path.startswith("/events"):
+            with LOCK:
+                rows = self.con.execute(
+                    "SELECT ts, agent, event, detail FROM events ORDER BY id DESC LIMIT 50").fetchall()
+                last_tick = get_state(self.con, "last_tick_ts")
+                last_price = get_state(self.con, "last_price")
+            out = []
+            for r in rows:
+                d = json.loads(r["detail"] or "{}")
+                why = d.get("reason") or d.get("why") or d.get("result") or ""
+                uk = datetime.fromisoformat(r["ts"]).astimezone(UK).strftime("%a %H:%M")
+                out.append(f"{uk}  {r['agent']}: {r['event']}  {why}".rstrip())
+            age = (f"{int(time.time() - last_tick)}s ago at {last_price}" if last_tick else "never")
+            text = (f"BCB Gold Desk {VERSION}\nLast price received: {age}\n"
+                    f"Alerts/events (newest first):\n" + ("\n".join(out) or "none yet"))
+            data = text.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         self._reply(404, {"error": "not found"})
 
     def do_POST(self):
@@ -485,6 +510,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(400, {"error": "body must be JSON"})
         secret = os.environ.get("WEBHOOK_SECRET")
         if not secret or payload.get("secret") != secret:
+            journal(self.con, "Desk", "BAD SECRET", {"reason": f"{self.path} - secret in TradingView doesn't match Railway"},
+                    datetime.now(timezone.utc))
             return self._reply(403, {"error": "bad secret"})
         cfg, now = load_config(), datetime.now(timezone.utc)
         try:
