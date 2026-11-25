@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "bcbdesk_config.yaml"))
@@ -258,13 +258,24 @@ def shield(card, cfg, con, now):
         return block(f"Grade {card['grade']} below minimum {cfg['min_grade']}")
 
     bal = balance(con, cfg)
-    risk_gbp = bal * cfg["risk_per_trade_pct"] / 100
-    lots_raw = (risk_gbp * card["gbpusd"]) / (card["risk_usd"] * cfg["oz_per_lot"])
+    mode = str(cfg.get("sizing_mode", "MARGIN")).upper()
+    if mode == "MARGIN":
+        # use a fixed share of the account as margin, with the broker's leverage
+        margin_gbp = bal * cfg.get("margin_use_pct", 75) / 100
+        notional_usd = margin_gbp * cfg.get("leverage", 20) * card["gbpusd"]
+        lots_raw = notional_usd / (card["entry"] * cfg["oz_per_lot"])
+    else:
+        risk_gbp = bal * cfg["risk_per_trade_pct"] / 100
+        lots_raw = (risk_gbp * card["gbpusd"]) / (card["risk_usd"] * cfg["oz_per_lot"])
     lots = int(lots_raw * 100) / 100  # round DOWN to 0.01
     if lots < 0.01:
         return block("Position size below 0.01 lots")
     if lots > cfg["max_lots"]:
         return block(f"Size {lots} lots is above max_lots {cfg['max_lots']} (stop too tight?)")
+    risk_if_stopped = lots * card["risk_usd"] * cfg["oz_per_lot"] / card["gbpusd"]
+    max_risk = bal * cfg.get("max_risk_pct", 20) / 100
+    if risk_if_stopped > max_risk:
+        return block(f"Stop too far: would lose £{risk_if_stopped:.0f}, over the £{max_risk:.0f} limit")
     approval_id = uuid.uuid4().hex
     con.execute("INSERT INTO approvals VALUES (?,?,0)", (approval_id, now.timestamp()))
     con.commit()
