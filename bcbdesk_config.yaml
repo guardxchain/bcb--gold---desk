@@ -1,0 +1,36 @@
+# config.yaml — BCB Gold Desk. Plain English. Edit, save, upload to GitHub.
+# Every line is "setting: value  # what it means"
+
+market: XAUUSD
+signal_chart: 15m              # FX Trader swing 14/14
+entry_chart: 5m
+sessions_allowed: [Asia, London, NewYork]
+asia_hours: "00:00-07:00"      # UK time
+london_hours: "07:00-16:30"    # UK time
+newyork_hours: "13:30-21:00"   # UK time
+flat_by: "21:45"               # UK time - any open trade is closed, nothing held overnight
+min_grade: C                   # C = take every swing flip (A or B = pickier)
+
+mode: PAPER                    # PAPER or LIVE
+live_trading: false            # only becomes true after you type "go live"
+balance_start_gbp: 5000        # Pepperstone cTrader demo
+risk_per_trade_pct: 5          # £250 at £5,000
+daily_loss_limit_pct: 10       # Shield stops everything at -£500 (2 losses)
+max_losses_in_a_row: 2
+daily_profit_target_pct: 1000  # no profit cap - keep trading the swings
+stop_after_target_win: false   # keep trading after a winner
+max_open_trades: 1
+exit_on_opposite_signal: true  # a swing flip the other way closes the open trade (as in FX Trader)
+max_lots: 3.0                  # Shield blocks anything bigger (catches a stop that is far too tight)
+
+take_profit_r: 0               # 0 = no fixed target, hold until the swing flips (or 3 = take profit at 3x risk)
+spread_usd_estimate: 0.25      # ESTIMATE until real cTrader fills replace it
+slippage_usd_estimate: 0.10    # ESTIMATE
+gbpusd_estimate: 1.27          # ESTIMATE, only used if the alert doesn't send the rate
+oz_per_lot: 100                # Pepperstone gold: 1 lot = 100 oz
+
+alert_max_age_seconds: 120     # Scout ignores older alerts (STALE)
+feed_max_age_seconds: 60       # Shield blocks if the last price tick is older than this
+feed_dead_warn_seconds: 180    # Telegram warning if prices stop arriving in a session
+
+daily_report_time: "21:30"     # UK time
