@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "bcbdesk_config.yaml"))
@@ -73,6 +73,11 @@ def db():
         CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);
         """
     )
+    try:
+        con.execute("ALTER TABLE trades ADD COLUMN confirmed INTEGER DEFAULT 0")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # already there
     return con
 
 
@@ -341,9 +346,71 @@ def close_trade(con, cfg, trade, exit_price, why, now):
 
 
 # ---------------------------------------------------------------- handlers
-def handle_alert(alert, cfg, con, now):
+def open_new(card, cfg, con, now, result, confirmed, tag):
+    decision = shield(card, cfg, con, now)
+    journal(con, "Shield", decision["decision"], decision, now)
+    result["shield"] = decision
+    if decision["decision"] != "APPROVE":
+        if card["grade"] == "A":
+            send_telegram(f"A-grade {card['side']} setup BLOCKED by Shield: {decision['reason']}")
+        return result
+    fill = pilot(card, decision, cfg, con, now)
+    journal(con, "Pilot", fill["result"], fill, now)
+    result["pilot"] = fill
+    if fill.get("trade_id"):
+        con.execute("UPDATE trades SET confirmed=? WHERE id=?", (1 if confirmed else 0, fill["trade_id"]))
+        con.commit()
+        send_telegram(f"PAPER {card['side']} XAUUSD {decision['lots']} lots @ {fill.get('fill')} | "
+                      f"stop {card['stop']} | {tag} | loss if stopped £{decision['risk_gbp']}\n{card['reason']}")
+    return result
+
+
+def five_fifteen(card, tf, cfg, con, now, result):
+    """5m flip = early entry. 15m flip the same way = confirmed, hold until the 15m flips back.
+    A 5m flip back before the 15m confirms = false start, get out."""
+    side = card["side"]
+    set_state(con, f"trend{tf}", side)
+    trade = open_trade(con)
+    last = get_state(con, "last_price") or card["entry"]
+    trend15, trend5 = get_state(con, "trend15"), get_state(con, "trend5")
+    if tf == "5":
+        if trade and trade["side"] == side:
+            result["note"] = "already in this direction"
+            return result
+        if trade and trade["confirmed"]:
+            journal(con, "Pilot", "HOLD", {"reason": f"5m {side} wobble ignored - trade confirmed by 15m"}, now)
+            result["note"] = "holding - 15m confirmed"
+            return result
+        if trade:
+            result["closed"] = close_trade(con, cfg, trade, last, "5m false start", now)
+        confirmed = trend15 == side
+        return open_new(card, cfg, con, now, result, confirmed,
+                        "5m entry, already confirmed by 15m" if confirmed else "5m entry, waiting for 15m")
+    # 15-minute flip
+    if trade and trade["side"] == side:
+        new_stop = card["stop"]
+        ok = new_stop < last if side == "BUY" else new_stop > last
+        if not trade["confirmed"]:
+            if ok:
+                con.execute("UPDATE trades SET confirmed=1, stop=? WHERE id=?", (new_stop, trade["id"]))
+            else:
+                con.execute("UPDATE trades SET confirmed=1 WHERE id=?", (trade["id"],))
+            con.commit()
+            journal(con, "Pilot", "CONFIRMED", {"reason": f"15m agrees - holding to the 15m flip, stop {new_stop if ok else trade['stop']}"}, now)
+            send_telegram(f"15m CONFIRMS the {side} - holding until the 15m flips. Stop now {new_stop if ok else trade['stop']}.")
+        result["note"] = "confirmed"
+        return result
+    if trade:
+        result["closed"] = close_trade(con, cfg, trade, last, "15m flipped", now)
+    if trend5 is None or trend5 == side:  # no 5m alert yet, or 5m already agrees
+        return open_new(card, cfg, con, now, result, True, "15m flip, 5m agrees")
+    result["note"] = "15m flipped, waiting for a 5m entry"
+    return result
+
+
+def handle_alert(alert, cfg, con, now, tf="15"):
     with LOCK:
-        key = "|".join(str(alert.get(k, "")) for k in ("symbol", "side", "time", "price"))
+        key = tf + "|" + "|".join(str(alert.get(k, "")) for k in ("symbol", "side", "time", "price"))
         alert_id = hashlib.sha1(key.encode()).hexdigest()
         try:
             con.execute("INSERT INTO alerts VALUES (?,?)", (alert_id, now.isoformat()))
@@ -352,9 +419,14 @@ def handle_alert(alert, cfg, con, now):
             journal(con, "Scout", "DUPLICATE", {"alert_id": alert_id}, now)
             return {"scout": {"status": "DUPLICATE"}, "shield": None, "pilot": None}
         card = scout(alert, cfg, now)
-        journal(con, "Scout", card["status"], card, now)
+        journal(con, f"Scout {tf}m", card["status"], card, now)
         result = {"scout": card, "shield": None, "pilot": None}
         if card["status"] != "SETUP":
+            return result
+        if str(cfg.get("entry_mode", "5_15")).replace("_", "") == "515":
+            return five_fifteen(card, tf, cfg, con, now, result)
+        if tf != "15":
+            result["note"] = "5m alert ignored in 15_only mode"
             return result
         trade = open_trade(con)
         if trade and trade["side"] != card["side"] and cfg.get("exit_on_opposite_signal"):
@@ -527,7 +599,9 @@ class Handler(BaseHTTPRequestHandler):
         cfg, now = load_config(), datetime.now(timezone.utc)
         try:
             if self.path == "/alert":
-                return self._reply(200, handle_alert(payload, cfg, self.con, now))
+                return self._reply(200, handle_alert(payload, cfg, self.con, now, tf="15"))
+            if self.path == "/alert5":
+                return self._reply(200, handle_alert(payload, cfg, self.con, now, tf="5"))
             if self.path == "/tick":
                 return self._reply(200, handle_tick(payload, cfg, self.con, now))
         except Exception as exc:
