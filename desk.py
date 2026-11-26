@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "bcbdesk_config.yaml"))
@@ -260,6 +260,7 @@ class CTrader:
         self.host, self.port, self.use_tls = host or self.HOSTS.get(self.env, self.HOSTS["demo"]), port, use_tls
         self.account_id = None
         self.symbol = None
+        self.candidates = []
 
     def configured(self):
         missing = [k for k, v in (("CTRADER_CLIENT_ID", self.client_id), ("CTRADER_CLIENT_SECRET", self.client_secret),
@@ -305,17 +306,34 @@ class CTrader:
             raise
 
     def _symbol(self, ws, name="XAUUSD"):
+        """Find the gold symbol that can actually be traded. Brokers often list several
+        (XAUUSD, XAU/USD, XAUUSD.r ...) and some are locked with an absurd minimum size."""
         if self.symbol:
             return self.symbol
         res = self._call(ws, 2114, {"ctidTraderAccountId": self.account_id}, {2115: None})
-        hits = [s for s in res.get("symbol", []) if str(s.get("symbolName", "")).upper().replace("/", "") == name]
-        if not hits:
+        key = lambda n: "".join(ch for ch in str(n).upper() if ch.isalpha())
+        cands = [s for s in res.get("symbol", []) if key(s.get("symbolName", "")).startswith(key(name))
+                 or key(s.get("symbolName", "")) in ("GOLD", "GOLDUSD", "XAUUSD")]
+        if not cands:
             raise CTraderError(f"{name} not found on this account")
-        sid = int(hits[0]["symbolId"])
-        info = self._call(ws, 2116, {"ctidTraderAccountId": self.account_id, "symbolId": [sid]}, {2117: None})
-        s = (info.get("symbol") or [{}])[0]
-        self.symbol = {"id": sid, "lotSize": int(s.get("lotSize", 10000)), "minVolume": int(s.get("minVolume", 100)),
-                       "stepVolume": int(s.get("stepVolume", 100)), "digits": int(s.get("digits", 2))}
+        ids = [int(s["symbolId"]) for s in cands]
+        names = {int(s["symbolId"]): s.get("symbolName") for s in cands}
+        info = self._call(ws, 2116, {"ctidTraderAccountId": self.account_id, "symbolId": ids}, {2117: None})
+        self.candidates = []
+        for s in info.get("symbol", []):
+            sid = int(s.get("symbolId"))
+            lot = int(s.get("lotSize", 10000))
+            mn = int(s.get("minVolume", 100))
+            self.candidates.append({"id": sid, "name": names.get(sid), "lotSize": lot, "minVolume": mn,
+                                    "stepVolume": int(s.get("stepVolume", 100)), "digits": int(s.get("digits", 2)),
+                                    "tradable": mn <= lot})
+        ok = [c for c in self.candidates if c["tradable"]]
+        if not ok:
+            raise CTraderError("no tradable gold symbol on this account: " +
+                               "; ".join(f"{c['name']} (id {c['id']}) min {c['minVolume'] / c['lotSize']:g} lots"
+                                         for c in self.candidates))
+        exact = [c for c in ok if key(c["name"]) == key(name)]
+        self.symbol = (exact or ok)[0]
         return self.symbol
 
     def check(self):
@@ -324,7 +342,8 @@ class CTrader:
             t = self._call(ws, 2121, {"ctidTraderAccountId": self.account_id}, {2122: None}).get("trader", {})
             sym = self._symbol(ws)
             bal = int(t.get("balance", 0)) / (10 ** int(t.get("moneyDigits", 2)))
-            return {"ok": True, "account": self.login, "env": self.env, "balance": round(bal, 2), "xauusd": sym}
+            return {"ok": True, "account": self.login, "env": self.env, "balance": round(bal, 2),
+                    "trading_symbol": sym, "gold_symbols_found": self.candidates}
         finally:
             ws.close()
 
