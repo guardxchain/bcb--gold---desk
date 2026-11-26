@@ -30,7 +30,7 @@ gbpusd_estimate: 1.27          # ESTIMATE, only used if the alert doesn't send t
 oz_per_lot: 100                # Pepperstone gold: 1 lot = 100 oz
 
 alert_max_age_seconds: 120     # Scout ignores older alerts (STALE)
-feed_max_age_seconds: 60       # Shield blocks if the last price tick is older than this
+feed_max_age_seconds: 360      # Shield blocks if the last price tick is older than this
 feed_dead_warn_seconds: 180    # Telegram warning if prices stop arriving in a session
 
 daily_report_time: "21:30"     # UK time
