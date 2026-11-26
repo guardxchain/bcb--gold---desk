@@ -6,9 +6,13 @@ TradingView sends two kinds of webhook to this service:
   POST /tick   - the latest 1-minute candle (keeps prices fresh, manages paper trades)
 GET /health and GET /status are for checking it is alive.
 """
+import base64
 import hashlib
 import json
 import os
+import socket
+import ssl
+import struct
 import sqlite3
 import threading
 import time
@@ -18,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "bcbdesk_config.yaml"))
@@ -78,6 +82,12 @@ def db():
         con.commit()
     except sqlite3.OperationalError:
         pass  # already there
+    for col in ("broker_pos INTEGER", "volume INTEGER"):
+        try:
+            con.execute(f"ALTER TABLE trades ADD COLUMN {col}")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass
     return con
 
 
@@ -153,6 +163,225 @@ def send_telegram(text, wait=False):
         return _send()
     threading.Thread(target=_send, daemon=True).start()
     return True
+
+
+# ---------------------------------------------------------------- cTrader link (Open API, JSON over WebSocket)
+class CTraderError(Exception):
+    pass
+
+
+class _WS:
+    """Tiny WebSocket client using only the standard library."""
+
+    def __init__(self, host, port, use_tls=True, timeout=15):
+        raw = socket.create_connection((host, port), timeout=timeout)
+        self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if use_tls else raw
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+                           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                           f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise CTraderError("cTrader closed the connection during handshake")
+            resp += chunk
+        head, self.buf = resp.split(b"\r\n\r\n", 1)
+        if b" 101" not in head.split(b"\r\n")[0]:
+            raise CTraderError("cTrader refused the WebSocket connection: " + head.split(b"\r\n")[0].decode(errors="ignore"))
+
+    def _frame(self, opcode, data):
+        mask = os.urandom(4)
+        n = len(data)
+        hdr = bytearray([0x80 | opcode])
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126); hdr += struct.pack(">H", n)
+        else:
+            hdr.append(0x80 | 127); hdr += struct.pack(">Q", n)
+        self.sock.sendall(bytes(hdr) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def send(self, text):
+        self._frame(0x1, text.encode())
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise CTraderError("cTrader connection closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def recv(self):
+        msg = b""
+        while True:
+            b1, b2 = self._read(2)
+            op, n = b1 & 0x0F, b2 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            mask = self._read(4) if b2 & 0x80 else None
+            data = self._read(n)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if op == 0x9:
+                self._frame(0xA, data)
+                continue
+            if op == 0xA:
+                continue
+            if op == 0x8:
+                raise CTraderError("cTrader closed the connection")
+            msg += data
+            if b1 & 0x80:
+                return msg.decode()
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class CTrader:
+    HOSTS = {"demo": "demo.ctraderapi.com", "live": "live.ctraderapi.com"}
+
+    def __init__(self, env=None, host=None, port=5036, use_tls=True):
+        env = env if env is not None else os.environ
+        self.client_id = env.get("CTRADER_CLIENT_ID", "").strip()
+        self.client_secret = env.get("CTRADER_CLIENT_SECRET", "").strip()
+        self.token = env.get("CTRADER_ACCESS_TOKEN", "").strip()
+        self.login = env.get("CTRADER_ACCOUNT_LOGIN", "").strip()
+        self.env = env.get("CTRADER_ENV", "demo").strip().lower()
+        self.host, self.port, self.use_tls = host or self.HOSTS.get(self.env, self.HOSTS["demo"]), port, use_tls
+        self.account_id = None
+        self.symbol = None
+
+    def configured(self):
+        missing = [k for k, v in (("CTRADER_CLIENT_ID", self.client_id), ("CTRADER_CLIENT_SECRET", self.client_secret),
+                                  ("CTRADER_ACCESS_TOKEN", self.token), ("CTRADER_ACCOUNT_LOGIN", self.login)) if not v]
+        return missing
+
+    def _call(self, ws, ptype, payload, want, timeout=20):
+        ws.send(json.dumps({"clientMsgId": uuid.uuid4().hex, "payloadType": ptype, "payload": payload}))
+        end = time.time() + timeout
+        while time.time() < end:
+            msg = json.loads(ws.recv())
+            pt, pl = msg.get("payloadType"), msg.get("payload") or {}
+            if pt in (50, 2142, 2132):
+                raise CTraderError(f"{pl.get('errorCode', 'ERROR')}: {pl.get('description', '')}".strip(": "))
+            if pt == 2126 and pl.get("executionType") == 7:  # ORDER_REJECTED
+                raise CTraderError(f"order rejected: {pl.get('errorCode', '')}")
+            if pt in want and (pt != 2126 or want[pt](pl)):
+                return pl
+        raise CTraderError(f"no reply from cTrader to message {ptype}")
+
+    def session(self):
+        missing = self.configured()
+        if missing:
+            raise CTraderError("missing Railway variables: " + ", ".join(missing))
+        ws = _WS(self.host, self.port, self.use_tls)
+        try:
+            self._call(ws, 2100, {"clientId": self.client_id, "clientSecret": self.client_secret}, {2101: None})
+            if self.account_id is None:
+                res = self._call(ws, 2149, {"accessToken": self.token}, {2150: None})
+                accounts = res.get("ctidTraderAccount", [])
+                match = [a for a in accounts if str(a.get("traderLogin")) == self.login]
+                if not match:
+                    seen = ", ".join(f"{a.get('traderLogin')} ({'live' if a.get('isLive') else 'demo'})" for a in accounts)
+                    raise CTraderError(f"account {self.login} not found for this token. Token can see: {seen or 'none'}")
+                acc = match[0]
+                if acc.get("isLive") and self.env != "live":
+                    raise CTraderError(f"account {self.login} is a LIVE account - refused (desk is demo only)")
+                self.account_id = int(acc["ctidTraderAccountId"])
+            self._call(ws, 2102, {"ctidTraderAccountId": self.account_id, "accessToken": self.token}, {2103: None})
+            return ws
+        except Exception:
+            ws.close()
+            raise
+
+    def _symbol(self, ws, name="XAUUSD"):
+        if self.symbol:
+            return self.symbol
+        res = self._call(ws, 2114, {"ctidTraderAccountId": self.account_id}, {2115: None})
+        hits = [s for s in res.get("symbol", []) if str(s.get("symbolName", "")).upper().replace("/", "") == name]
+        if not hits:
+            raise CTraderError(f"{name} not found on this account")
+        sid = int(hits[0]["symbolId"])
+        info = self._call(ws, 2116, {"ctidTraderAccountId": self.account_id, "symbolId": [sid]}, {2117: None})
+        s = (info.get("symbol") or [{}])[0]
+        self.symbol = {"id": sid, "lotSize": int(s.get("lotSize", 10000)), "minVolume": int(s.get("minVolume", 100)),
+                       "stepVolume": int(s.get("stepVolume", 100)), "digits": int(s.get("digits", 2))}
+        return self.symbol
+
+    def check(self):
+        ws = self.session()
+        try:
+            t = self._call(ws, 2121, {"ctidTraderAccountId": self.account_id}, {2122: None}).get("trader", {})
+            sym = self._symbol(ws)
+            bal = int(t.get("balance", 0)) / (10 ** int(t.get("moneyDigits", 2)))
+            return {"ok": True, "account": self.login, "env": self.env, "balance": round(bal, 2), "xauusd": sym}
+        finally:
+            ws.close()
+
+    def volume_for(self, lots, sym):
+        vol = int(round(lots * sym["lotSize"] / sym["stepVolume"])) * sym["stepVolume"]
+        return max(vol, sym["minVolume"])
+
+    def open_market(self, side, lots, stop_distance):
+        ws = self.session()
+        try:
+            sym = self._symbol(ws)
+            vol = self.volume_for(lots, sym)
+            req = {"ctidTraderAccountId": self.account_id, "symbolId": sym["id"], "orderType": 1,
+                   "tradeSide": 1 if side == "BUY" else 2, "volume": vol,
+                   "relativeStopLoss": int(round(stop_distance * 100000)), "label": "BCBDesk"}
+            ev = self._call(ws, 2106, req, {2126: lambda p: p.get("executionType") == 3 and p.get("position")})
+            pos, deal = ev["position"], ev.get("deal", {})
+            price = deal.get("executionPrice") or pos.get("price")
+            return {"positionId": int(pos["positionId"]), "price": float(price), "volume": vol}
+        finally:
+            ws.close()
+
+    def amend_stop(self, position_id, stop):
+        ws = self.session()
+        try:
+            self._call(ws, 2110, {"ctidTraderAccountId": self.account_id, "positionId": position_id,
+                                  "stopLoss": round(stop, 2)}, {2126: lambda p: True})
+        finally:
+            ws.close()
+
+    def close_position(self, position_id, volume):
+        ws = self.session()
+        try:
+            ev = self._call(ws, 2111, {"ctidTraderAccountId": self.account_id, "positionId": position_id,
+                                       "volume": volume}, {2126: lambda p: p.get("executionType") == 3})
+            return float((ev.get("deal") or {}).get("executionPrice") or 0) or None
+        finally:
+            ws.close()
+
+    def open_positions(self):
+        ws = self.session()
+        try:
+            res = self._call(ws, 2124, {"ctidTraderAccountId": self.account_id}, {2125: None})
+            return {int(p["positionId"]) for p in res.get("position", [])}
+        finally:
+            ws.close()
+
+
+CT = None
+
+
+def broker(cfg):
+    """Returns the cTrader link when the config says to use it, otherwise None (paper)."""
+    global CT
+    if str(cfg.get("broker", "PAPER")).upper() != "CTRADER":
+        return None
+    if CT is None:
+        CT = CTrader()
+    return CT
 
 
 # ---------------------------------------------------------------- SCOUT
@@ -306,19 +535,41 @@ def pilot(card, approval, cfg, con, now):
     if now.timestamp() - row["ts"] > 30:
         return {"result": "REFUSED", "reason": "Approval older than 30 seconds"}
     con.execute("UPDATE approvals SET used=1 WHERE approval_id=?", (row["approval_id"],))
+    con.commit()
     direction = 1 if card["side"] == "BUY" else -1
     last = get_state(con, "last_price") or card["entry"]
-    fill = last + direction * (cfg["spread_usd_estimate"] + cfg["slippage_usd_estimate"])
+    pos_id, volume, label = None, None, "FILLED (PAPER)"
+    bk = broker(cfg)
+    if bk is not None:
+        try:
+            stop_dist = abs(last - card["stop"])
+            res = bk.open_market(card["side"], approval["lots"], stop_dist)
+        except Exception as exc:
+            send_telegram(f"cTrader order FAILED ({card['side']} {approval['lots']} lots): {exc}")
+            return {"result": "REFUSED", "reason": f"cTrader: {exc}"}
+        fill, pos_id, volume, label = res["price"], res["positionId"], res["volume"], "FILLED (CTRADER DEMO)"
+    else:
+        fill = last + direction * (cfg["spread_usd_estimate"] + cfg["slippage_usd_estimate"])
     cur = con.execute(
-        "INSERT INTO trades(opened, uk_day, side, entry, stop, target, lots, risk_gbp, status, reason, gbpusd)"
-        " VALUES (?,?,?,?,?,?,?,?, 'OPEN', ?, ?)",
+        "INSERT INTO trades(opened, uk_day, side, entry, stop, target, lots, risk_gbp, status, reason, gbpusd,"
+        " broker_pos, volume) VALUES (?,?,?,?,?,?,?,?, 'OPEN', ?, ?, ?, ?)",
         (now.isoformat(), uk_day(now), card["side"], round(fill, 2), card["stop"], card["target"],
-         approval["lots"], approval["risk_gbp"], card["reason"], card["gbpusd"]))
+         approval["lots"], approval["risk_gbp"], card["reason"], card["gbpusd"], pos_id, volume))
     con.commit()
-    return {"result": "FILLED (PAPER)", "trade_id": cur.lastrowid, "fill": round(fill, 2)}
+    return {"result": label, "trade_id": cur.lastrowid, "fill": round(fill, 2), "position": pos_id}
 
 
-def close_trade(con, cfg, trade, exit_price, why, now):
+def close_trade(con, cfg, trade, exit_price, why, now, already_closed=False):
+    bk = broker(cfg) if trade["broker_pos"] else None
+    if bk is not None and not already_closed:
+        try:
+            real = bk.close_position(int(trade["broker_pos"]), int(trade["volume"]))
+            exit_price = real or exit_price
+        except Exception as exc:
+            journal(con, "Pilot", "CLOSE FAILED", {"reason": str(exc)}, now)
+            send_telegram(f"cTrader CLOSE FAILED for position {trade['broker_pos']} ({why}): {exc}. "
+                          f"Check the cTrader app and close it by hand if it's still open.")
+            return "OPEN", 0.0
     direction = 1 if trade["side"] == "BUY" else -1
     pnl_usd = (exit_price - trade["entry"]) * direction * trade["lots"] * cfg["oz_per_lot"]
     pnl_gbp = round(pnl_usd / trade["gbpusd"], 2)
@@ -351,8 +602,7 @@ def open_new(card, cfg, con, now, result, confirmed, tag):
     journal(con, "Shield", decision["decision"], decision, now)
     result["shield"] = decision
     if decision["decision"] != "APPROVE":
-        if card["grade"] == "A":
-            send_telegram(f"A-grade {card['side']} setup BLOCKED by Shield: {decision['reason']}")
+        send_telegram(f"{card['side']} signal ({tag}) BLOCKED by Shield: {decision['reason']}")
         return result
     fill = pilot(card, decision, cfg, con, now)
     journal(con, "Pilot", fill["result"], fill, now)
@@ -391,6 +641,13 @@ def five_fifteen(card, tf, cfg, con, now, result):
         new_stop = card["stop"]
         ok = new_stop < last if side == "BUY" else new_stop > last
         if not trade["confirmed"]:
+            bk = broker(cfg) if trade["broker_pos"] else None
+            if ok and bk is not None:
+                try:
+                    bk.amend_stop(int(trade["broker_pos"]), new_stop)
+                except Exception as exc:
+                    ok = False
+                    send_telegram(f"cTrader stop move FAILED ({exc}) - stop left at {trade['stop']}.")
             if ok:
                 con.execute("UPDATE trades SET confirmed=1, stop=? WHERE id=?", (new_stop, trade["id"]))
             else:
@@ -464,6 +721,18 @@ def handle_tick(tick, cfg, con, now):
         if not trade:
             return {"ok": True}
         slip = cfg["slippage_usd_estimate"]
+        hit = (low <= trade["stop"]) if trade["side"] == "BUY" else (high >= trade["stop"])
+        bk = broker(cfg) if trade["broker_pos"] else None
+        if hit and bk is not None:
+            try:
+                still_open = int(trade["broker_pos"]) in bk.open_positions()
+            except Exception as exc:
+                journal(con, "Pilot", "CHECK FAILED", {"reason": str(exc)}, now)
+                return {"ok": True}
+            if still_open:
+                return {"ok": True}  # cTrader's own stop hasn't triggered yet
+            ex = trade["stop"] - slip if trade["side"] == "BUY" else trade["stop"] + slip
+            return {"closed": close_trade(con, cfg, trade, ex, "stop (cTrader)", now, already_closed=True)}
         if trade["side"] == "BUY":
             if low <= trade["stop"]:  # stop first if both touched - worst case
                 return {"closed": close_trade(con, cfg, trade, trade["stop"] - slip, "stop", now)}
@@ -550,6 +819,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path.startswith("/ctrader-check"):
+            bk = CTrader()
+            try:
+                return self._reply(200, bk.check())
+            except Exception as exc:
+                return self._reply(200, {"ok": False, "error": str(exc)})
         if self.path == "/health":
             return self._reply(200, {"ok": True, "version": VERSION})
         if self.path == "/status":
@@ -557,7 +832,14 @@ class Handler(BaseHTTPRequestHandler):
             now = datetime.now(timezone.utc)
             with LOCK:
                 t = open_trade(self.con)
-            return self._reply(200, {"mode": cfg["mode"], "balance_gbp": balance(self.con, cfg),
+                last = get_state(self.con, "last_price")
+            live = None
+            if t and last:
+                dirn = 1 if t["side"] == "BUY" else -1
+                live = round((last - t["entry"]) * dirn * t["lots"] * cfg["oz_per_lot"] / t["gbpusd"], 2)
+            return self._reply(200, {"mode": cfg["mode"], "broker": str(cfg.get("broker", "PAPER")),
+                                     "open_trade_pnl_gbp": live, "last_price": last,
+                                     "balance_gbp": balance(self.con, cfg),
                                      "day_pnl_gbp": day_pnl(self.con, now),
                                      "open_trade": dict(t) if t else None,
                                      "stopped_today": stopped_today(self.con, now)})
