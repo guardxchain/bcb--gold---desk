@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "bcbdesk_config.yaml"))
@@ -328,15 +328,24 @@ class CTrader:
         finally:
             ws.close()
 
-    def volume_for(self, lots, sym):
-        vol = int(round(lots * sym["lotSize"] / sym["stepVolume"])) * sym["stepVolume"]
-        return max(vol, sym["minVolume"])
+    def volume_for(self, lots, sym, max_lots=3.0):
+        """Volume in cTrader units (cents). Never rounds UP to a broker minimum and never
+        exceeds max_lots - if the size is outside what we asked for, refuse instead."""
+        step = max(int(sym.get("stepVolume") or 1), 1)
+        vol = int(lots * sym["lotSize"] // step) * step
+        if vol <= 0:
+            raise CTraderError(f"{lots} lots is below cTrader's smallest step")
+        if vol > max_lots * sym["lotSize"]:
+            raise CTraderError(f"size {vol / sym['lotSize']} lots is above max_lots {max_lots} - refused")
+        return vol
 
-    def open_market(self, side, lots, stop_distance):
+    def open_market(self, side, lots, stop_distance, max_lots=3.0):
+        if stop_distance <= 0:
+            raise CTraderError("no valid stop distance - refused")
         ws = self.session()
         try:
             sym = self._symbol(ws)
-            vol = self.volume_for(lots, sym)
+            vol = self.volume_for(lots, sym, max_lots)
             req = {"ctidTraderAccountId": self.account_id, "symbolId": sym["id"], "orderType": 1,
                    "tradeSide": 1 if side == "BUY" else 2, "volume": vol,
                    "relativeStopLoss": int(round(stop_distance * 100000)), "label": "BCBDesk"}
@@ -545,7 +554,7 @@ def pilot(card, approval, cfg, con, now):
     if bk is not None:
         try:
             stop_dist = abs(last - card["stop"])
-            res = bk.open_market(card["side"], approval["lots"], stop_dist)
+            res = bk.open_market(card["side"], approval["lots"], stop_dist, cfg.get("max_lots", 3.0))
         except Exception as exc:
             send_telegram(f"cTrader order FAILED ({card['side']} {approval['lots']} lots): {exc}")
             return {"result": "REFUSED", "reason": f"cTrader: {exc}"}
