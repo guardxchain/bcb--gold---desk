@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "bcbdesk_config.yaml"))
@@ -250,6 +250,8 @@ class CTrader:
 
     def __init__(self, env=None, host=None, port=5036, use_tls=True):
         env = env if env is not None else os.environ
+        # tolerate names saved with stray spaces / line breaks (e.g. pasted on a phone)
+        env = {str(k).strip().upper(): str(v).strip() for k, v in env.items()}
         self.client_id = env.get("CTRADER_CLIENT_ID", "").strip()
         self.client_secret = env.get("CTRADER_CLIENT_SECRET", "").strip()
         self.token = env.get("CTRADER_ACCESS_TOKEN", "").strip()
@@ -821,10 +823,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/ctrader-check"):
             bk = CTrader()
+            seen = [repr(k) for k in os.environ if "CTRADER" in k.upper()]
             try:
-                return self._reply(200, bk.check())
+                out = bk.check()
             except Exception as exc:
-                return self._reply(200, {"ok": False, "error": str(exc)})
+                out = {"ok": False, "error": str(exc)}
+            out["variable_names_seen"] = seen or "none containing CTRADER"
+            return self._reply(200, out)
         if self.path == "/health":
             return self._reply(200, {"ok": True, "version": VERSION})
         if self.path == "/status":
