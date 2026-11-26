@@ -11,7 +11,8 @@ newyork_hours: "13:30-21:00"   # UK time
 flat_by: "21:45"               # UK time - any open trade is closed, nothing held overnight
 min_grade: C                   # C = take every swing flip (A or B = pickier)
 
-mode: PAPER                    # PAPER or LIVE
+mode: PAPER 
+broker: CTRADER
 live_trading: false            # only becomes true after you type "go live"
 balance_start_gbp: 5000        # Pepperstone cTrader demo
 risk_per_trade_pct: 10          # £500 at £5,000
