@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-VERSION = "1.5.3"
+VERSION = "1.6.0"
 UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "bcbdesk_config.yaml"))
@@ -261,6 +261,16 @@ class CTrader:
         self.account_id = None
         self.symbol = None
         self.candidates = []
+        self.want = None      # symbol name from the config, e.g. XAUUSD_SB
+        self.strict = False
+        self.stake_usd_move = 1.0  # spread bet: £ stake is per this many $ of gold movement
+
+    def setup(self, cfg):
+        # Pepperstone UK spread betting account: only the _SB symbols can trade. Spot = XAUUSD_SB (matches TradingView)
+        self.want = str(cfg.get("ctrader_symbol") or "XAUUSD_SB").strip()
+        self.strict = True
+        self.stake_usd_move = float(cfg.get("sb_point_usd", 1.0) or 1.0)
+        return self
 
     def configured(self):
         missing = [k for k, v in (("CTRADER_CLIENT_ID", self.client_id), ("CTRADER_CLIENT_SECRET", self.client_secret),
@@ -305,15 +315,16 @@ class CTrader:
             ws.close()
             raise
 
-    def _symbol(self, ws, name="XAUUSD"):
+    def _symbol(self, ws, name=None):
         """Find the gold symbol that can actually be traded. Brokers often list several
         (XAUUSD, XAU/USD, XAUUSD.r ...) and some are locked with an absurd minimum size."""
-        if self.symbol:
+        name = name or self.want or "XAUUSD"
+        if self.symbol and self.symbol.get("asked") == name:
             return self.symbol
         res = self._call(ws, 2114, {"ctidTraderAccountId": self.account_id}, {2115: None})
         key = lambda n: "".join(ch for ch in str(n).upper() if ch.isalpha())
-        cands = [s for s in res.get("symbol", []) if key(s.get("symbolName", "")).startswith(key(name))
-                 or key(s.get("symbolName", "")) in ("GOLD", "GOLDUSD", "XAUUSD")]
+        cands = [s for s in res.get("symbol", []) if key(s.get("symbolName", "")).startswith("XAU")
+                 or key(s.get("symbolName", "")).startswith("GOLD")]
         if not cands:
             raise CTraderError(f"{name} not found on this account")
         ids = [int(s["symbolId"]) for s in cands]
@@ -332,8 +343,19 @@ class CTrader:
             raise CTraderError("no tradable gold symbol on this account: " +
                                "; ".join(f"{c['name']} (id {c['id']}) min {c['minVolume'] / c['lotSize']:g} lots"
                                          for c in self.candidates))
-        exact = [c for c in ok if key(c["name"]) == key(name)]
-        self.symbol = (exact or ok)[0]
+        exact = [c for c in self.candidates if key(c["name"]) == key(name)]
+        if self.strict:
+            # a symbol was named in the config: use exactly that one or nothing (never a CFD by accident)
+            if not exact:
+                raise CTraderError(f"{name} not found on this account. Gold symbols seen: "
+                                   + ", ".join(str(c["name"]) for c in self.candidates))
+            if not exact[0]["tradable"]:
+                raise CTraderError(f"{name} is locked on this account (min {exact[0]['minVolume']} units)")
+            pick = exact[0]
+        else:
+            pick = ([c for c in exact if c["tradable"]] or ok)[0]
+        pick = dict(pick, asked=name, spread_bet=str(pick["name"]).upper().replace("-", "_").split("_")[-1] in ("SB", "SBE"))
+        self.symbol = pick
         return self.symbol
 
     def check(self):
@@ -347,31 +369,43 @@ class CTrader:
         finally:
             ws.close()
 
-    def volume_for(self, lots, sym, max_lots=3.0):
+    def size_units(self, lots, sym, gbpusd=1.27, oz_per_lot=100):
+        """What we ask cTrader for, in its own display units: lots for CFDs,
+        £ per point stakes for spread bets (same money exposure as the lots)."""
+        if sym.get("spread_bet"):
+            return lots * oz_per_lot * self.stake_usd_move / gbpusd
+        return lots
+
+    def volume_for(self, lots, sym, max_lots=3.0, gbpusd=1.27, oz_per_lot=100):
         """Volume in cTrader units (cents). Never rounds UP to a broker minimum and never
         exceeds max_lots - if the size is outside what we asked for, refuse instead."""
+        units = self.size_units(lots, sym, gbpusd, oz_per_lot)
+        cap = self.size_units(max_lots, sym, gbpusd, oz_per_lot)
         step = max(int(sym.get("stepVolume") or 1), 1)
-        vol = int(lots * sym["lotSize"] // step) * step
-        if vol <= 0:
-            raise CTraderError(f"{lots} lots is below cTrader's smallest step")
-        if vol > max_lots * sym["lotSize"]:
-            raise CTraderError(f"size {vol / sym['lotSize']} lots is above max_lots {max_lots} - refused")
+        vol = int(round(units * sym["lotSize"], 6) // step) * step
+        word = "stake" if sym.get("spread_bet") else "lots"
+        if vol <= 0 or vol < int(sym.get("minVolume") or 0):
+            raise CTraderError(f"{units:.2f} {word} is below cTrader's minimum")
+        if vol > cap * sym["lotSize"] + 1e-9:
+            raise CTraderError(f"size {vol / sym['lotSize']:g} {word} is above the max ({cap:.2f}) - refused")
         return vol
 
-    def open_market(self, side, lots, stop_distance, max_lots=3.0):
+    def open_market(self, side, lots, stop_distance, max_lots=3.0, gbpusd=1.27, oz_per_lot=100):
         if stop_distance <= 0:
             raise CTraderError("no valid stop distance - refused")
         ws = self.session()
         try:
             sym = self._symbol(ws)
-            vol = self.volume_for(lots, sym, max_lots)
+            vol = self.volume_for(lots, sym, max_lots, gbpusd, oz_per_lot)
             req = {"ctidTraderAccountId": self.account_id, "symbolId": sym["id"], "orderType": 1,
                    "tradeSide": 1 if side == "BUY" else 2, "volume": vol,
                    "relativeStopLoss": int(round(stop_distance * 100000)), "label": "BCBDesk"}
             ev = self._call(ws, 2106, req, {2126: lambda p: p.get("executionType") == 3 and p.get("position")})
             pos, deal = ev["position"], ev.get("deal", {})
             price = deal.get("executionPrice") or pos.get("price")
-            return {"positionId": int(pos["positionId"]), "price": float(price), "volume": vol}
+            return {"positionId": int(pos["positionId"]), "price": float(price), "volume": vol,
+                    "symbol": sym["name"], "size": vol / sym["lotSize"],
+                    "unit": "£/pt stake" if sym.get("spread_bet") else "lots"}
         finally:
             ws.close()
 
@@ -379,7 +413,7 @@ class CTrader:
         ws = self.session()
         try:
             self._call(ws, 2110, {"ctidTraderAccountId": self.account_id, "positionId": position_id,
-                                  "stopLoss": round(stop, 2)}, {2126: lambda p: True})
+                                  "stopLoss": round(stop, int((self.symbol or {}).get("digits", 2)))}, {2126: lambda p: True})
         finally:
             ws.close()
 
@@ -411,7 +445,7 @@ def broker(cfg):
         return None
     if CT is None:
         CT = CTrader()
-    return CT
+    return CT.setup(cfg)
 
 
 # ---------------------------------------------------------------- SCOUT
@@ -573,11 +607,15 @@ def pilot(card, approval, cfg, con, now):
     if bk is not None:
         try:
             stop_dist = abs(last - card["stop"])
-            res = bk.open_market(card["side"], approval["lots"], stop_dist, cfg.get("max_lots", 3.0))
+            res = bk.open_market(card["side"], approval["lots"], stop_dist, cfg.get("max_lots", 3.0),
+                                 card["gbpusd"], cfg["oz_per_lot"])
         except Exception as exc:
             send_telegram(f"cTrader order FAILED ({card['side']} {approval['lots']} lots): {exc}")
             return {"result": "REFUSED", "reason": f"cTrader: {exc}"}
-        fill, pos_id, volume, label = res["price"], res["positionId"], res["volume"], "FILLED (CTRADER DEMO)"
+        fill, pos_id, volume = res["price"], res["positionId"], res["volume"]
+        label = f"FILLED (CTRADER DEMO) {res.get('symbol')} {res.get('size'):g} {res.get('unit')}"
+        send_telegram(f"cTrader DEMO: {card['side']} {res.get('symbol')} {res.get('size'):g} {res.get('unit')} "
+                      f"filled @ {fill}")
     else:
         fill = last + direction * (cfg["spread_usd_estimate"] + cfg["slippage_usd_estimate"])
     cur = con.execute(
@@ -850,12 +888,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/ctrader-check"):
-            bk = CTrader()
+            ccfg = load_config()
+            bk = CTrader().setup(ccfg)
             seen = [repr(k) for k in os.environ if "CTRADER" in k.upper()]
             try:
                 out = bk.check()
             except Exception as exc:
                 out = {"ok": False, "error": str(exc)}
+            if out.get("ok"):
+                sym = out["trading_symbol"]
+                ex = bk.size_units(0.27, sym, ccfg.get("gbpusd_estimate", 1.27), ccfg.get("oz_per_lot", 100))
+                out["example"] = (f"0.27 lots of exposure = {ex:.2f} {'£ per point stake' if sym.get('spread_bet') else 'lots'}"
+                                  f" on {sym['name']}")
             out["variable_names_seen"] = seen or "none containing CTRADER"
             return self._reply(200, out)
         if self.path == "/health":
@@ -934,7 +978,10 @@ def main():
     threading.Thread(target=watchdog_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     print(f"BCB Gold Desk {VERSION} listening on {port}")
-    send_telegram(f"BCB Gold Desk {VERSION} started (PAPER).")
+    _c = load_config()
+    send_telegram(f"BCB Gold Desk {VERSION} started ("
+                  + (f"cTrader demo, {_c.get('ctrader_symbol') or 'XAUUSD_SB'}" if str(_c.get('broker', '')).upper() == 'CTRADER'
+                     else "PAPER") + ").")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
