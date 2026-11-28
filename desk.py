@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-VERSION = "1.6.0"
+VERSION = "1.6.2"
 UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DESK_CONFIG", os.path.join(HERE, "bcbdesk_config.yaml"))
@@ -173,7 +173,7 @@ class CTraderError(Exception):
 class _WS:
     """Tiny WebSocket client using only the standard library."""
 
-    def __init__(self, host, port, use_tls=True, timeout=15):
+    def __init__(self, host, port, use_tls=True, timeout=40):
         raw = socket.create_connection((host, port), timeout=timeout)
         self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if use_tls else raw
         key = base64.b64encode(os.urandom(16)).decode()
@@ -634,10 +634,36 @@ def close_trade(con, cfg, trade, exit_price, why, now, already_closed=False):
             real = bk.close_position(int(trade["broker_pos"]), int(trade["volume"]))
             exit_price = real or exit_price
         except Exception as exc:
-            journal(con, "Pilot", "CLOSE FAILED", {"reason": str(exc)}, now)
-            send_telegram(f"cTrader CLOSE FAILED for position {trade['broker_pos']} ({why}): {exc}. "
-                          f"Check the cTrader app and close it by hand if it's still open.")
-            return "OPEN", 0.0
+            gone = False
+            if "MARKET_CLOSED" not in str(exc):
+                try:  # a timeout may still have closed it - ask cTrader what is really open
+                    gone = int(trade["broker_pos"]) not in bk.open_positions()
+                except Exception:
+                    gone = False
+            if not gone and "MARKET_CLOSED" in str(exc) and why == "flat by close":
+                # market shut before we could get flat: let it ride, the 5m/15m signals manage it from the reopen
+                if get_state(con, "carry_pos") != trade["broker_pos"]:
+                    set_state(con, "carry_pos", trade["broker_pos"])
+                    journal(con, "Pilot", "CARRY", {"pos": trade["broker_pos"]}, now)
+                    send_telegram(f"Gold closed before the desk could close position {trade['broker_pos']}. "
+                                  "Letting it ride - the stop stays on in cTrader and the next swing flip will close it.")
+                return "OPEN", 0.0
+            if not gone:
+                msg = str(exc)
+                kind = "MARKET_CLOSED" if "MARKET_CLOSED" in msg else msg[:40]
+                wait = 1800 if kind == "MARKET_CLOSED" else 300
+                set_state(con, "close_retry_at", now.timestamp() + wait)
+                journal(con, "Pilot", "CLOSE FAILED", {"reason": msg}, now)
+                if get_state(con, "close_fail_note") != f"{trade['broker_pos']}|{kind}":
+                    set_state(con, "close_fail_note", f"{trade['broker_pos']}|{kind}")
+                    extra = (" Gold is closed - the stop stays on in cTrader and I'll close it as soon as the market reopens."
+                             if kind == "MARKET_CLOSED" else f" Retrying every {wait // 60} min (no more messages unless it changes).")
+                    send_telegram(f"cTrader CLOSE FAILED for position {trade['broker_pos']} ({why}): {msg}.{extra}")
+                return "OPEN", 0.0
+    if bk is not None:
+        set_state(con, "close_fail_note", None)
+        set_state(con, "close_retry_at", None)
+        set_state(con, "carry_pos", None)
     direction = 1 if trade["side"] == "BUY" else -1
     pnl_usd = (exit_price - trade["entry"]) * direction * trade["lots"] * cfg["oz_per_lot"]
     pnl_gbp = round(pnl_usd / trade["gbpusd"], 2)
@@ -849,7 +875,9 @@ def watchdog_once(cfg, con, now):
         local = now.astimezone(UK)
         trade = open_trade(con)
         last = get_state(con, "last_price")
-        if trade and last and local.hour * 60 + local.minute >= _minutes(cfg["flat_by"]):
+        retry_at = get_state(con, "close_retry_at") or 0
+        if trade and last and local.hour * 60 + local.minute >= _minutes(cfg["flat_by"]) \
+                and now.timestamp() >= retry_at and trade["broker_pos"] != get_state(con, "carry_pos"):
             close_trade(con, cfg, trade, last, "flat by close", now)
         last_tick = get_state(con, "last_tick_ts")
         if in_session(cfg, now) and not get_state(con, "feed_warned"):
